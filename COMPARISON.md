@@ -1849,17 +1849,17 @@ Because KDB+ does not possess a native GPU compilation pipeline, writing a purel
 ## 3.1 · Where To Use Which Language
 
 ```
-DOMAIN                           BEST FIT        WHY                                    2ND CHOICE
-───────────────────────────────  ──────────────  ─────────────────────────────────────  ──────────
-Tick-data storage/analytics,     Q (kdb+)        Purpose-built columnar time-series      Python
-historical research, backtest                    engine; qSQL as-of joins are the         (polars)
+DOMAIN                           BEST FIT        WHY                                       2ND CHOICE
+───────────────────────────────  ──────────────  ─────────────────────────────────────     ──────────
+Tick-data storage/analytics,     Q (kdb+)        Purpose-built columnar time-series        Python
+historical research, backtest                    engine; qSQL as-of joins are the          (polars)
 over years of tick history                       industry standard for this exact job
 
-Alpha research / prototyping,    Python          Fastest iteration loop; pandas/numpy/    Q for
-signal exploration, notebook-                    sklearn/statsmodels ecosystem            tick-native
-driven statistics                                unmatched for exploratory research       research
+Alpha research / prototyping,    Python          Fastest iteration loop; pandas/numpy/     Q for
+signal exploration, notebook-                    sklearn/statsmodels ecosystem             tick-native
+driven statistics                                unmatched for exploratory research        research
 
-Execution engine / OMS / market  C++26 or Rust   Deterministic sub-microsecond latency,   The other
+Execution engine / OMS / market  C++26 or Rust   Deterministic sub-microsecond latency,    The other
 data handler (hot path)                          zero GC pause; Rust preferred for new     of the two
                                                  builds (memory safety, equal speed)
 
@@ -1871,26 +1871,26 @@ Exchange gateway / FIX engine    C++26 or Rust   Predictable latency tail (p99.9
                                                  GC, direct control of NIC buffer/kernel
                                                  bypass (DPDK/io_uring) integration
 
-Tickerplant / RDB / HDB          Q (kdb+)        This is q's native deployment              —
+Tickerplant / RDB / HDB          Q (kdb+)        This is q's native deployment             —
 (kdb+ standard architecture)                     architecture — no substitute is as
                                                  battle-tested industry-wide for this
 
-Research infra glue / ML         Python          PyTorch/JAX ecosystem dominance;           —
+Research infra glue / ML         Python          PyTorch/JAX ecosystem dominance;          —
 pipelines, feature stores                        C++/Rust bindings exist but Python is
                                                  still where the models are authored
 
-GPU-accelerated Monte Carlo /    Python (CuPy/   Fastest path to CUDA; Rust/C++ needed      Rust
-pricing libraries                Torch) or C++   only if GPU kernel dispatch itself is       (wgpu/
-                                 (CUDA/SYCL)     on the latency-critical path                cudarc)
+GPU-accelerated Monte Carlo /    Python (CuPy/   Fastest path to CUDA; Rust/C++ needed     Rust
+pricing libraries                Torch) or C++   only if GPU kernel dispatch itself is     (wgpu/
+                                 (CUDA/SYCL)     on the latency-critical path               cudarc)
 
-New greenfield low-latency       Rust            Memory safety with zero performance         C++26
+New greenfield low-latency       Rust            Memory safety with zero performance       C++26
 systems (2024+ shops)                            cost eliminates an entire production
                                                  incident class vs C++; steeper initial
                                                  learning curve is the main tradeoff
 
-Long-lived legacy HFT codebase   C++26           Institutional inertia + existing            Rust for
-maintenance & extension                          libraries (Boost, existing FIX/SBE          NEW modules
-                                                 codecs) outweigh rewrite cost               only
+Long-lived legacy HFT codebase   C++26           Institutional inertia + existing          Rust for
+maintenance & extension                          libraries (Boost, existing FIX/SBE        NEW modules
+                                                 codecs) outweigh rewrite cost             only
 ```
 
 [🔝 Back to Top](#-table-of-contents)
