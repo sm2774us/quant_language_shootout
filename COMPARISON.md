@@ -551,231 +551,872 @@ Formatting          f-strings:                  `std::format` (C++20),      `for
 ## 2.1 · Data Structures — Fixed-Capacity Ring Buffer (Order Book Tick Store)
 
 ```cpp
-// C++26 — benchmarks/cpp/ring_buffer.hpp
+// C++26 — High-Performance Zero-Allocation Ring Buffer
+// Utilizes compile-time power-of-2 sizing to substitute expensive modulo divisions 
+// with ultra-fast bitwise masking, backed by cache-line alignment.
+#include <array>
+#include <cstddef>
+#include <cassert>
+#include <new>
+
+#ifdef __cpp_lib_hardware_interference_size
+    constexpr std::size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+#else
+    constexpr std::size_t CACHE_LINE_SIZE = 64;
+#endif
+
 template <typename T, std::size_t N>
 class RingBuffer {
-    alignas(64) std::array<T, N> buf_{};
-    std::size_t head_ = 0, count_ = 0;
+    // Enforce power of 2 capacity for bitwise mask wrapping: index & (N - 1)
+    static_assert((N != 0) && ((N & (N - 1)) == 0), "RingBuffer capacity N must be a power of 2");
+
+    alignas(CACHE_LINE_SIZE) std::array<T, N> buf_{};
+    std::size_t head_ = 0;
+    std::size_t count_ = 0;
+
 public:
+    constexpr RingBuffer() noexcept = default;
+
     constexpr void push(const T& v) noexcept {
-        buf_[(head_ + count_) % N] = v;
-        if (count_ < N) ++count_; else head_ = (head_ + 1) % N;
+        const std::size_t idx = (head_ + count_) & (N - 1);
+        buf_[idx] = v;
+        if (count_ < N) {
+            ++count_;
+        } else {
+            // Overwrite oldest entry; advance head pointer
+            head_ = (head_ + 1) & (N - 1);
+        }
     }
+
+    constexpr void push(T&& v) noexcept {
+        const std::size_t idx = (head_ + count_) & (N - 1);
+        buf_[idx] = std::move(v);
+        if (count_ < N) {
+            ++count_;
+        } else {
+            head_ = (head_ + 1) & (N - 1);
+        }
+    }
+
     [[nodiscard]] constexpr const T& operator[](std::size_t i) const noexcept {
-        return buf_[(head_ + i) % N];
+        assert(i < count_ && "Index out of bounds for active ring buffer window");
+        return buf_[(head_ + i) & (N - 1)];
     }
+
+    [[nodiscard]] constexpr T& operator[](std::size_t i) noexcept {
+        assert(i < count_ && "Index out of bounds for active ring buffer window");
+        return buf_[(head_ + i) & (N - 1)];
+    }
+
     [[nodiscard]] constexpr std::size_t size() const noexcept { return count_; }
+    [[nodiscard]] constexpr std::size_t capacity() const noexcept { return N; }
+    [[nodiscard]] constexpr bool empty() const noexcept { return count_ == 0; }
+    [[nodiscard]] constexpr bool full() const noexcept { return count_ == N; }
+
+    constexpr void clear() noexcept {
+        head_ = 0;
+        count_ = 0;
+    }
 };
+
 ```
 
+**Architecture & Execution Explanation:**
+In market data capture pipelines, ring buffers must operate with zero dynamic heap allocations and minimal CPU instruction cycles. This C++26 implementation enforces a compile-time `static_assert` requiring the capacity `N` to be a power of 2. This enables the replacement of costly CPU integer division instructions (`% N`) with bitwise AND masking `& (N - 1)`, shaving crucial nanoseconds off tick ingestion loops. Furthermore, `alignas(CACHE_LINE_SIZE)` guarantees that the internal array is aligned to L1/L2 cache boundaries, completely preventing cache splitting artifacts.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ constant time for insertion (`push`) and retrieval (`operator[]`).
+* **Space Complexity:** $O(N)$ fixed compile-time stack or static allocation matching the template parameter `N`.
+
+---
+
 ```rust
-// Rust 1.97.1 — benchmarks/rust/src/ring_buffer.rs
-#[repr(align(64))]
+// Rust 1.97.1 — Zero-Overhead Unsafe Ring Buffer
+// Uses MaybeUninit to bypass redundant default-initialization penalties and enforces 
+// power-of-2 bitwise masking for high-frequency tick streams.
+use std::mem::MaybeUninit;
+
 pub struct RingBuffer<T, const N: usize> {
-    buf: [T; N],
+    buf: [MaybeUninit<T>; N],
     head: usize,
     count: usize,
 }
-impl<T: Copy + Default, const N: usize> RingBuffer<T, N> {
-    pub fn new() -> Self { Self { buf: [T::default(); N], head: 0, count: 0 } }
-    pub fn push(&mut self, v: T) {
-        let idx = (self.head + self.count) % N;
-        self.buf[idx] = v;
-        if self.count < N { self.count += 1 } else { self.head = (self.head + 1) % N }
+
+impl<T, const N: usize> RingBuffer<T, N> {
+    pub const fn new() -> Self {
+        // Compile-time power of 2 check in const context (Rust 1.97+)
+        assert!(N > 0 && (N & (N - 1)) == 0, "RingBuffer capacity N must be a power of 2");
+        
+        // Create an uninitialized array safely without requiring T: Default
+        Self {
+            buf: unsafe { MaybeUninit::uninit().assume_init() },
+            head: 0,
+            count: 0,
+        }
     }
-    pub fn get(&self, i: usize) -> &T { &self.buf[(self.head + i) % N] }
+
+    pub fn push(&mut self, v: T) {
+        let idx = (self.head + self.count) & (N - 1);
+        
+        if self.count < N {
+            self.buf[idx] = MaybeUninit::new(v);
+            self.count += 1;
+        } else {
+            // Drop or overwrite existing value at head
+            unsafe {
+                let ptr = self.buf[idx].as_mut_ptr();
+                std::ptr::drop_in_place(ptr);
+                *ptr = v;
+            }
+            self.head = (self.head + 1) & (N - 1);
+        }
+    }
+
+    pub fn get(&self, i: usize) -> Option<&T> {
+        if i >= self.count {
+            return None;
+        }
+        let idx = (self.head + i) & (N - 1);
+        unsafe {
+            Some(&*self.buf[idx].as_ptr())
+        }
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut T> {
+        if i >= self.count {
+            return None;
+        }complex: 
+        let idx = (self.head + i) & (N - 1);
+        unsafe {
+            Some(&mut *self.buf[idx].as_mut_ptr())
+        }
+    }
+
+    pub fn len(&self) -> usize { self.count }
+    pub fn capacity(&self) -> usize { N }
+    pub fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn is_full(&self) -> bool { self.count == N }
 }
+
+impl<T, const N: usize> Drop for RingBuffer<T, N> {
+    fn drop(&mut self) {
+        // Ensure all active elements are properly dropped when the buffer goes out of scope
+        for i in 0..self.count {
+            let idx = (self.head + i) & (N - 1);
+            unsafe {
+                std::ptr::drop_in_place(self.buf[idx].as_mut_ptr());
+            }
+        }
+    }
+}
+
 ```
+
+**Architecture & Execution Explanation:**
+Standard Rust arrays require items to implement `Default` or `Clone` when initialized via `[T::default(); N]`, which introduces unacceptable overhead and restricts non-default types. This production-grade implementation utilizes `MaybeUninit<T>` arrays. This allows the buffer to instantiate unallocated memory instantly without executing default constructors. Bitwise wrapping via `& (N - 1)` mirrors the C++ optimization, and custom `Drop` implementation guarantees that manual memory deallocation and object dropping are handled without resource leaks.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ for insertion and indexed retrieval.
+* **Space Complexity:** $O(N)$ contiguous block allocated on the stack or owning struct frame.
+
+---
 
 ```python
-# Python 3.14.6 — benchmarks/python/ring_buffer.py
+# Python 3.14.6 — NumPy-Backed High-Performance Ring Buffer
+# Eliminates list overhead and object boxing by storing raw primitives in a contiguous NumPy array.
 import numpy as np
+from typing import Optional
+
 class RingBuffer:
-    __slots__ = ("buf", "head", "count", "n")
+    __slots__ = ("_buf", "_head", "_count", "_n")
+
     def __init__(self, n: int, dtype=np.float64) -> None:
-        self.buf = np.zeros(n, dtype=dtype)
-        self.head = 0
-        self.count = 0
-        self.n = n
+        if n <= 0 or (n & (n - 1)) != 0:
+            raise ValueError("RingBuffer capacity n must be a positive power of 2")
+        
+        # Pre-allocate contiguous memory buffer in C space
+        self._buf: np.ndarray = np.zeros(n, dtype=dtype)
+        self._head: int = 0
+        self._count: int = 0
+        self._n: int = n
+
     def push(self, v: float) -> None:
-        idx = (self.head + self.count) % self.n
-        self.buf[idx] = v
-        if self.count < self.n:
-            self.count += 1
+        # Bitwise modulo optimization via bitwise AND mask
+        idx = (self._head + self._count) & (self._n - 1)
+        self._buf[idx] = v
+        
+        if self._count < self._n:
+            self._count += 1
         else:
-            self.head = (self.head + 1) % self.n
+            self._head = (self._head + 1) & (self._n - 1)
+
     def __getitem__(self, i: int) -> float:
-        return self.buf[(self.head + i) % self.n]
+        if i < 0 or i >= self._count:
+            raise IndexError("RingBuffer index out of range")
+        idx = (self._head + i) & (self._n - 1)
+        return float(self._buf[idx])
+
+    def __len__(self) -> int:
+        return self._count
+
+    @property
+    def capacity(self) -> int:
+        return self._n
+
+    def clear(self) -> None:
+        self._head = 0
+        self._count = 0
+        self._buf.fill(0)
+
 ```
 
+**Architecture & Execution Explanation:**
+Standard Python lists are arrays of pointers to scattered heap objects, resulting in terrible cache locality and severe memory overhead. This implementation uses a pre-allocated `np.zeros` array backed by contiguous C-memory pointers. By leveraging `__slots__`, Python avoids dynamic `__dict__` dictionary lookups per instance, cutting attribute access latency. Bitwise wrapping `& (self._n - 1)` ensures that Python matches C++/Rust performance profiles when indexing high-frequency tick data streams.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ amortized instruction execution time for appends and indexed reads.
+* **Space Complexity:** $O(N)$ memory footprint allocated contiguously in C-heap space.
+
+---
+
 ```q
-/ Q (kdb+ 4.0) — benchmarks/q/ring_buffer.q
-/ q's native idiom: a fixed-length vector with a rolling write cursor;
-/ no class needed — state is just two globals plus a vector, kdb-native style
-ringInit:{[n] `ringBuf`ringHead`ringN set (n#0f; 0; n)}
-ringPush:{[v]
-  idx: ringHead mod ringN;
-  ringBuf[idx]: v;
-  ringHead+: 1 }
-ringGet:{[i] ringBuf[(ringHead - ringN + i) mod ringN]}
+/ Q (kdb+ 4.0) — Encapsulated Namespace Ring Buffer Engine
+/ Avoids unhygienic global scopes by utilizing a dictionary-based state container 
+/ combined with vectorized indexing and modulo arithmetic.
+
+ringBuffer: {
+    n: x;
+    / Validate power of 2 for bitwise-equivalent behavior or standard mod mask
+    if[0 < n;
+        / Return a dictionary acting as an object instance containing state and methods
+        enlist[`buf]!enlist(n#0f), enlist[`head]!0, enlist[`count]!0, enlist[`n]!n
+    ]
+ };
+
+/ Push method: updates the buffer in place and shifts head if capacity is reached
+ringPush: {[obj; v]
+    idx: (obj[`head] + obj[`count]) mod obj[`n];
+    obj[`buf][idx]: v;
+    if[obj[`count] < obj[`n];
+        obj[`count] +: 1;
+        :obj;
+    ];
+    obj[`head]: (obj[`head] + 1) mod obj[`n];
+    obj
+ };
+
+/ Get method: retrieves the item at logical index i relative to the rolling head
+ringGet: {[obj; i]
+    if[(i < 0) or (i >= obj[`count]); 'indexError];
+    idx: (obj[`head] + i) mod obj[`n];
+    obj[`buf][idx]
+ };
+
+/ Capacity and size accessors
+ringSize: {[obj] obj[`count]};
+ringCapacity: {[obj] obj[`n]};
+
 ```
+
+**Architecture & Execution Explanation:**
+Loose global variables (`ringBuf`, `ringHead`) represent an anti-pattern in complex KDB+ codebases. This robust implementation encapsulates state inside a dictionary-based class structure, passing state explicitly across function boundaries. The buffer relies on pre-allocated vector initialization (`n#0f`), allowing q's columnar update mechanics to execute in-place assignments without triggering dynamic memory reallocation penalties. Modulo arithmetic handles the ring wrapping efficiently over q's optimized numeric primitives.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ time complexity for state insertions and index lookups.
+* **Space Complexity:** $O(N)$ space allocated strictly inside KDB+'s optimized memory slab allocator.
 
 ---
 
 ## 2.2 · Algorithms — Parallel Prefix Sum / Rolling VWAP
 
 ```cpp
-// C++26 — std::execution::par for a parallel inclusive scan
+// C++26 — Two-Phase Parallel Prefix Scan (Inclusive Scan of Price * Quantity)
+// Utilizes std::execution::par_unseq for fully parallelized elementwise multiplication 
+// followed by a parallel inclusive prefix sum scan via standard vector execution policies.
 #include <numeric>
 #include <execution>
-void rolling_vwap(std::span<const double> px, std::span<const double> qty,
-                   std::span<double> out) {
-    std::vector<double> pxqty(px.size());
-    std::transform(std::execution::par_unseq, px.begin(), px.end(), qty.begin(),
-                    pxqty.begin(), std::multiplies<>{});
-    std::inclusive_scan(std::execution::par, pxqty.begin(), pxqty.end(), out.begin());
+#include <vector>
+#include <span>
+
+void rolling_vwap(std::span<const double> px, std::span<const double> qty, std::span<double> out) {
+    if (px.empty() || qty.empty()) return;
+    
+    const size_t n = px.size();
+    
+    // Allocate a temporary vector for the intermediate product pass.
+    // In an ultra-low latency system, this allocation would be pooled, but 
+    // std::vector guarantees contiguous cache-aligned layout for parallel traversals.
+    std::vector<double> pxqty(n);
+    
+    // Phase 1: Parallel elementwise multiplication (Price * Quantity)
+    std::transform(std::execution::par_unseq, 
+                   px.begin(), px.end(), 
+                   qty.begin(), 
+                   pxqty.begin(), 
+                   std::multiplies<>{});
+                   
+    // Phase 2: Parallel inclusive prefix scan (Cumulative Sum)
+    // std::inclusive_scan under par execution utilizes work-efficient parallel scan 
+    // algorithms (e.g., Blelloch/Hillis-Steele variants) across thread pools.
+    std::inclusive_scan(std::execution::par, 
+                        pxqty.begin(), pxqty.end(), 
+                        out.begin());
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+Calculating a cumulative Volume-Weighted Average Price (or strictly the cumulative numerator of VWAP, $\sum P \cdot Q$) presents an algorithmic challenge: prefix sums inherently carry a loop-carry dependency from index $i-1$ to $i$, making a naive parallel loop impossible. This implementation divides the problem into two distinct phases. First, it uses `std::execution::par_unseq` to vectorize and parallelize the cross-sectional multiplication of price and quantity across CPU cores. Second, it invokes `std::inclusive_scan(std::execution::par)`, which maps to a work-efficient parallel prefix-sum algorithm (like a block-based prefix scan) running across the persistent thread pool, maximizing throughput on multi-core systems.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N / P + \log P)$ wall-clock time, where $N$ is the vector length and $P$ is the number of active worker threads. The work complexity is strictly $O(N)$.
+* **Space Complexity:** $O(N)$ auxiliary space required for the temporary `pxqty` heap allocation, plus the pre-allocated `out` vector.
+
+---
 
 ```rust
-// Rust 1.97.1 — rayon parallel iterator, then a scan (rayon has no built-in parallel scan; 
-// chunk + sequential-scan-per-chunk + carry propagation is the idiomatic pattern)
+// Rust 1.97.1 — Fully Parallel Work-Efficient Prefix Sum via Rayon
+// Replaces the naive sequential fallback with a parallel chunk-based block-scan prefix reduction.
 use rayon::prelude::*;
+
 pub fn rolling_vwap(px: &[f64], qty: &[f64], out: &mut [f64]) {
-    let pxqty: Vec<f64> = px.par_iter().zip(qty.par_iter()).map(|(p, q)| p * q).collect();
-    let mut acc = 0.0;
-    for (o, v) in out.iter_mut().zip(pxqty.iter()) { acc += v; *o = acc; }
+    assert_eq!(px.len(), qty.len(), "Price and quantity dimensions must match");
+    assert_eq!(px.len(), out.len(), "Output dimension must match inputs");
+    
+    let n = px.len();
+    if n == 0 { return; }
+
+    // Phase 1: Parallel element-wise multiplication
+    let pxqty: Vec<f64> = px.par_iter()
+                           .zip(qty.par_iter())
+                           .map(|(p, q)| p * q)
+                           .collect();
+
+    // Phase 2: Parallel Block-Scan Prefix Sum
+    // Determine optimal chunk sizing based on available CPU cores
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (n + num_threads - 1) / num_threads;
+
+    if chunk_size == 0 { return; }
+
+    // Step A: Compute local sequential scans and extract block totals in parallel
+    let mut chunk_totals = Vec::with_capacity(num_threads);
+    let mut local_scans = Vec::with_capacity(num_threads);
+
+    // Parallel chunk mapping
+    let chunks: Vec<&[f64]> = pxqty.chunks(chunk_size).collect();
+    
+    // Evaluate local scans concurrently
+    let results: Vec<(f64, Vec<f64>)> = chunks.into_par_iter().map(|chunk| {
+        let mut local_sum = 0.0;
+        let mut scanned = Vec::with_capacity(chunk.len());
+        for &val in chunk {
+            local_sum += val;
+            scanned.push(local_sum);
+        }
+        (local_sum, scanned)
+    }).collect();
+
+    for (total, scanned) in results {
+        chunk_totals.push(total);
+        local_scans.push(scanned);
+    }
+
+    // Step B: Compute exclusive prefix scan (carry propagation) across chunk totals sequentially
+    let mut carry = 0.0;
+    let mut carried_totals = Vec::with_capacity(chunk_totals.len());
+    for total in chunk_totals {
+        carried_totals.push(carry);
+        carry += total;
+    }
+
+    // Step C: Parallel write-back combining local scans with carry offsets
+    out.par_chunks_mut(chunk_size)
+       .zip(local_scans.into_par_iter())
+       .zip(carried_totals.into_par_iter())
+       .for_each(|((out_chunk, local_scan), carry_val)| {
+           for (o, &s) in out_chunk.iter_mut().zip(local_scan.iter()) {
+               *o = s + carry_val;
+           }
+       });
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+While Rayon provides robust parallel iterators for elementwise transformations (`par_iter`), it lacks a built-in parallel scan primitive. A naive single-threaded loop for the carry propagation phase (as seen in basic implementations) introduces a sequential bottleneck for massive vectors. This robust implementation builds a custom parallel block prefix-sum algorithm: it partitions the array into chunks corresponding to core counts, computes local scans concurrently across worker threads, generates a carry-offset array, and distributes the final write-back in parallel. This ensures true parallel speedup across all phases.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N / P + P)$ wall-clock time, where $P$ is the number of Rayon thread pool workers. The parallel chunk reduction drops the sequential dependency to the number of threads rather than total elements $N$.
+* **Space Complexity:** $O(N)$ auxiliary space for `pxqty` and local chunk vectors, maintaining optimal contiguous memory layouts.
+
+---
 
 ```python
-# Python 3.14.6 — vectorized via NumPy (cumsum dispatches to a C SIMD kernel)
+# Python 3.14.6 — NumPy Vectorized C-Kernel Dispatch
+# Fully leverages NumPy's internal C-compiled routines for parallel accumulation.
 import numpy as np
+
 def rolling_vwap(px: np.ndarray, qty: np.ndarray) -> np.ndarray:
-    return np.cumsum(px * qty)
+    """
+    Computes the cumulative product sum (rolling VWAP numerator) 
+    utilizing C-optimized SIMD routines under the hood.
+    """
+    # Ensure contiguous C-order layout for zero-copy memory alignment
+    px_contig = np.ascontiguousarray(px, dtype=np.float64)
+    qty_contig = np.ascontiguousarray(qty, dtype=np.float64)
+    
+    # np.multiply dispatches directly to optimized SIMD blocks (AVX2/AVX-512)
+    # np.cumsum executes an optimized contiguous reduction pass.
+    return np.cumsum(px_contig * qty_contig)
+
 ```
+
+**Architecture & Execution Explanation:**
+In Python, custom loops over arrays are penalized by interpreter overhead. The institutional standard relies entirely on NumPy's underlying C-extension architecture. When executing `px * qty`, NumPy allocates a continuous memory buffer and dispatches vectorized SIMD instructions across CPU data lanes. Subsequently, `np.cumsum` executes a highly optimized reduction loop compiled in C. By forcing memory contiguity via `np.ascontiguousarray`, cache-miss penalties are eliminated, allowing Python to achieve near-native execution speed for vector accumulation.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$ executed in optimized C-space with zero Python interpreter overhead inside the loop.
+* **Space Complexity:** $O(N)$ space required to hold the returned cumulative sum array, alongside temporary internal memory allocated by NumPy for the elementwise product prior to reduction.
+
+---
 
 ```q
-/ Q — the entire operation is a one-liner via the `sums` adverb (cumulative sum primitive)
-rollingVwap:{[px;qty] sums px*qty}
+/ Q (kdb+ 4.0) — Primitive Composition Architecture
+/ The entire operation reduces to a single expression due to kdb+'s columnar design.
+
+rollingVwap:{[px; qty]
+    / 1. px * qty: Element-wise vector multiplication dispatches to SIMD C-kernels.
+    / 2. sums: Cumulative sum adverb computes the prefix sum natively in a single pass.
+    sums px * qty
+ }
+
+/ --- Architectural Context ---
+/ This example illustrates the mechanical sympathy of kdb+. 
+/ Operations requiring complex parallel-scan abstractions in C++/Rust or 
+/ explicit array functions in Python are expressed as a direct primitive composition in q.
+
 ```
 
-**This example is the clearest illustration of why q exists in this shootout at all:** the identical vectorized cumulative-sum-of-products operation that requires an explicit parallel-scan algorithm in C++/Rust and a NumPy call in Python is a **built-in primitive composition** in q — `sums px*qty` — because q's entire type system is column-vector-first. This is the mechanical-sympathy argument for kdb+ in tick-data analytics: the terse syntax isn't cleverness for its own sake, it's a direct reflection of the columnar execution model underneath.
+> [!NOTE]
+>
+> **This example is the clearest illustration of why q exists in this shootout at all:** the identical vectorized cumulative-sum-of-products operation that requires an explicit parallel-scan algorithm in C++/Rust and a NumPy call in Python is a **built-in primitive composition** in q — `sums px*qty` — because q's entire type system is column-vector-first. This is the mechanical-sympathy argument for kdb+ in tick-data analytics: the terse syntax isn't cleverness for its own sake, it's a direct reflection of the columnar execution model underneath.
+>
+
+**Architecture & Execution Explanation:**
+Kdb+ exists precisely for this class of operations. Because q's entire type system and memory allocator are columnar-first, vectors are stored contiguously in RAM with zero pointer-chasing overhead. The expression `px * qty` performs an instant SIMD multiplication across the columns. The cumulative sum adverb (`sums`) then dispatches directly to an internal, highly-tuned C routine that computes the prefix sum in a single linear pass. There is no need for explicit thread-pool configuration, manual chunking, or memory management boilerplate—the syntax mirrors the mathematical reality of the hardware execution model.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$ single-pass linear execution implemented natively in C.
+* **Space Complexity:** $O(N)$ space for the resulting cumulative vector allocated directly within KDB+'s specialized slab allocator.
 
 ---
 
 ## 2.3 · Multithreading — Parallel Signal Fan-Out
 
 ```cpp
-// C++26 — std::jthread pool computing N independent signals over the same tick window
+// C++26 — Standard Execution Policies (Thread Pool Abstraction)
+// Spawning raw std::jthread per tick is an anti-pattern due to OS thread creation latency.
+// The institutional standard delegates work-stealing and pooling to the compiler's TBB/OpenMP backend.
 #include <vector>
-#include <thread>
-#include <barrier>
+#include <span>
+#include <execution>
+#include <algorithm>
+#include <functional>
+
 void compute_signals_parallel(std::span<const double> px,
-                               std::span<double(*)(std::span<const double>)> signal_fns,
-                               std::span<double> results) {
-    std::vector<std::jthread> pool;
-    for (std::size_t i = 0; i < signal_fns.size(); ++i)
-        pool.emplace_back([&, i] { results[i] = signal_fns[i](px); });
-    // jthreads auto-join on destruction (RAII)
+                              std::span<const std::function<double(std::span<const double>)>> signal_fns,
+                              std::span<double> results) {
+    if (signal_fns.empty()) return;
+    
+    // std::execution::par_unseq maps execution to a persistent, highly optimized 
+    // internal thread pool, executing the lambda concurrently across available CPU cores.
+    std::transform(std::execution::par_unseq,
+                   signal_fns.begin(), 
+                   signal_fns.end(),
+                   results.begin(),
+                   [px](const auto& func) { 
+                       return func(px); 
+                   });
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+Creating and destroying OS-level threads (`std::jthread` or `std::thread`) on a per-tick or per-window basis incurs catastrophic latency (typically 10-30 microseconds per thread). The optimal architecture avoids manual thread management entirely. C++17/20/26 Standard Execution Policies (`std::execution::par_unseq`) interface directly with highly tuned backend libraries like Intel Threading Building Blocks (TBB). The `std::transform` algorithm assigns the signal function array to the persistent thread pool, safely depositing the evaluated alpha signals into the pre-allocated `results` buffer concurrently.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(M \cdot K / P)$ wall-clock time, where $M$ is the number of signal functions, $K$ is the internal time complexity of evaluating a single signal over the price vector `px`, and $P$ is the number of active CPU cores in the thread pool.
+* **Space Complexity:** $O(1)$ auxiliary space. Zero heap allocation is performed inside the function block; it writes directly into the pre-allocated `results` span.
+
+---
 
 ```rust
-// Rust 1.97.1 — std::thread::scope (borrow-checked scoped threads, no Arc needed for &[f64])
-pub fn compute_signals_parallel(px: &[f64], signal_fns: &[fn(&[f64]) -> f64], results: &mut [f64]) {
-    std::thread::scope(|s| {
-        for (i, f) in signal_fns.iter().enumerate() {
-            let px = &px; let r = &results[i] as *const f64 as *mut f64; // demo only
-            s.spawn(move || unsafe { *r = f(px) });
-        }
-    });
+// Rust 1.97.1 — Rayon Data Parallelism
+// Eradicates the unsafe raw pointer casting required by naive std::thread::scope implementations.
+use rayon::prelude::*;
+
+pub fn compute_signals_parallel(
+    px: &[f64],
+    signal_fns: &[fn(&[f64]) -> f64],
+    results: &mut [f64]
+) {
+    assert_eq!(signal_fns.len(), results.len(), "Buffer dimensions must match");
+
+    // Rayon is the undisputed institutional standard for Rust data parallelism.
+    // It provides a zero-overhead, work-stealing thread pool initialized at startup.
+    // par_iter_mut() safely partitions the mutable output slice across worker threads.
+    results.par_iter_mut()
+           .zip_eq(signal_fns.par_iter())
+           .for_each(|(r, f)| {
+               *r = f(px);
+           });
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+Attempting to map multiple mutable pointers to the same array across threads will trigger aggressive compiler rejections from Rust's borrow checker. Bypassing this with `unsafe` raw pointers defeats the purpose of utilizing Rust. `Rayon` is the production idiom for resolving this. Under the hood, `par_iter_mut()` safely divides the `results` slice into disjoint, non-overlapping mutable references based on CPU core availability. `zip_eq` perfectly aligns the signal functions to these mutable outputs, distributing the work across Rayon's global work-stealing thread pool without a single `unsafe` block or atomic lock.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(M \cdot K / P)$ wall-clock time. Rayon's work-stealing scheduler ensures that if one signal takes drastically longer to evaluate than others (e.g., an expensive MACD vs. a simple SMA), idle CPU cores will dynamically steal the remaining tasks, minimizing straggler latency.
+* **Space Complexity:** $O(1)$ auxiliary space. Execution mutates the passed `results` slice in place.
+
+---
 
 ```python
-# Python 3.14.6 — free-threaded build (python3.14t) gives true parallel CPU-bound threads;
-# on the standard GIL build, use ProcessPoolExecutor for true parallelism instead
-from concurrent.futures import ThreadPoolExecutor
-def compute_signals_parallel(px, signal_fns):
-    with ThreadPoolExecutor(max_workers=len(signal_fns)) as ex:
-        return list(ex.map(lambda f: f(px), signal_fns))
+# Python 3.14.6 — ThreadPoolExecutor on Free-Threaded (NoGIL) CPython
+# Assumes Python 3.13+ PEP 703 free-threaded build where the GIL is permanently disabled.
+import numpy as np
+import concurrent.futures
+from typing import List, Callable
+
+def compute_signals_parallel(px: np.ndarray, signal_fns: List[Callable[[np.ndarray], float]]) -> np.ndarray:
+    n_signals = len(signal_fns)
+    results = np.empty(n_signals, dtype=np.float64)
+    
+    if n_signals == 0:
+        return results
+
+    # In modern free-threaded Python, ThreadPoolExecutor achieves true CPU-bound parallelism
+    # within the same memory space, entirely avoiding ProcessPoolExecutor's IPC pickle serialization.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_signals) as executor:
+        # Map submits the jobs and yields results in the exact order of signal_fns
+        computed_values = executor.map(lambda f: f(px), signal_fns)
+        
+        for i, val in enumerate(computed_values):
+            results[i] = val
+            
+    return results
+
 ```
 
+**Architecture & Execution Explanation:**
+Historically, fanning out CPU-bound work in Python required `concurrent.futures.ProcessPoolExecutor` or `multiprocessing`. This architecture required serializing (pickling) the `px` array, transmitting it over IPC sockets, and unpickling it in the child process—a catastrophic overhead that often outweighed the parallel speedup. With the introduction of PEP 703 (Free-Threaded CPython 3.13+), the Global Interpreter Lock (GIL) is disabled. This allows `ThreadPoolExecutor` to run standard Python threads concurrently on separate CPU cores, reading the exact same `px` NumPy array in shared memory without locking or serialization.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(M \cdot K / P)$ wall-clock time.
+* **Space Complexity:** $O(M)$ auxiliary space dynamically allocated inside the executor to track the `Future` objects and the returned iterable from `executor.map`, alongside the $O(M)$ size of the returned `results` array.
+
+---
+
 ```q
-/ Q — peach (parallel-each) dispatches over slave threads started with -s N at process launch
-computeSignalsParallel:{[px;signalFns] signalFns peach px}
+/ Q (kdb+ 4.0) — Peach (Parallel Each) Dispatch 
+/ Slave threads must be initialized via the -s N command line flag at process start.
+/ Q natively handles the thread-pool management and memory distribution in C.
+
+computeSignalsParallel:{[px; signalFns]
+    / 1. Projection: {x[y]}[; px] creates a dynamic unary function that 
+    /    takes a function 'x' and applies it to the fixed market data 'px'.
+    / 2. peach: Distributes the array of signalFns across the slave threads.
+    
+    results: {x[y]}[; px] peach signalFns;
+    
+    results
+ }
+
 ```
+
+**Architecture & Execution Explanation:**
+KDB+ possesses native map-reduce primitives via `peach` (parallel each). When a kdb+ instance is booted with the `-s` flag (e.g., `q script.q -s 8`), it spins up a persistent pool of C-level OS threads. Unlike Python or C++, there are no external libraries or explicit executor context managers to define. The expression `{x[y]}[; px]` uses q's projection feature to lock the `px` vector into the function's scope, mapping the list of `signalFns` directly to the thread pool. The engine automatically partitions the list, executes them, and recombines the outputs into a contiguous q list guaranteeing ordinality.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(M \cdot K / P)$ wall-clock time. `peach` automatically optimizes data boundary partitions at the C-level, eliminating typical map-reduce scheduling overhead.
+* **Space Complexity:** $O(M)$ space for the returned list. Note that kdb+ handles parallel memory management via a specialized thread-local slab allocator, which strictly avoids mutex contention on `malloc` during the fan-out phase.
 
 ---
 
 ## 2.4 · Concurrency — Lock-Free SPSC Queue (Market Data → Strategy)
 
 ```cpp
-// C++26 — single-producer/single-consumer ring, atomics with acquire/release, no mutex
+// C++26 — Single-Producer/Single-Consumer Ring Buffer
+// Utilizes acquire/release memory semantics, cache-line padding to prevent false sharing, 
+// and bitwise modulo operations for zero-overhead ring wrapping.
+#include <atomic>
+#include <array>
+#include <new>
+
+// Utilize C++17/20 standard for L1 cache line size to prevent false sharing.
+#ifdef __cpp_lib_hardware_interference_size
+    constexpr std::size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+#else
+    constexpr std::size_t CACHE_LINE_SIZE = 64;
+#endif
+
 template <typename T, std::size_t N>
 class SpscQueue {
-    alignas(64) std::atomic<std::size_t> head_{0};
-    alignas(64) std::atomic<std::size_t> tail_{0};
-    std::array<T, N> buf_{};
+    // Capacity must be a power of 2 for the fast bitwise modulo optimization
+    static_assert((N != 0) && ((N & (N - 1)) == 0), "Queue size must be a power of 2");
+
+    alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> head_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> tail_{0};
+    
+    // Pad the buffer to isolate it from the tail atomic to prevent cache invalidation storms
+    alignas(CACHE_LINE_SIZE) std::array<T, N> buf_{};
+
 public:
     bool push(const T& v) noexcept {
-        auto h = head_.load(std::memory_order_relaxed);
-        auto next = (h + 1) % N;
-        if (next == tail_.load(std::memory_order_acquire)) return false; // full
-        buf_[h] = v;
-        head_.store(next, std::memory_order_release);
+        const auto current_head = head_.load(std::memory_order_relaxed);
+        const auto next_head = (current_head + 1) & (N - 1); 
+        
+        // Acquire memory order guarantees that reads/writes from the consumer are visible
+        if (next_head == tail_.load(std::memory_order_acquire)) {
+            return false; // Queue full
+        }
+        
+        buf_[current_head] = v;
+        
+        // Release memory order ensures the payload is written before the head increments
+        head_.store(next_head, std::memory_order_release);
         return true;
     }
+
     bool pop(T& out) noexcept {
-        auto t = tail_.load(std::memory_order_relaxed);
-        if (t == head_.load(std::memory_order_acquire)) return false; // empty
-        out = buf_[t];
-        tail_.store((t + 1) % N, std::memory_order_release);
+        const auto current_tail = tail_.load(std::memory_order_relaxed);
+        
+        if (current_tail == head_.load(std::memory_order_acquire)) {
+            return false; // Queue empty
+        }
+        
+        out = buf_[current_tail];
+        tail_.store((current_tail + 1) & (N - 1), std::memory_order_release);
         return true;
     }
 };
+
 ```
+
+**Architecture & Execution Explanation:**
+This implementation represents the absolute lowest latency bound for inter-thread communication on modern x86/ARM architectures. The core institutional optimizations are three-fold:
+
+1. **Memory Ordering:** It completely abandons `std::mutex`. Instead, it uses `std::memory_order_acquire` and `std::memory_order_release`. This ensures that the producer's write to `buf_` is strictly visible to the consumer *before* the consumer sees the updated `head_`, without triggering a full CPU memory barrier (`seq_cst`).
+2. **False Sharing Elimination:** `head_` and `tail_` are heavily mutated by different threads. If they fall on the same 64-byte L1 cache line, the CPU cores will continuously invalidate each other's caches (cache-line bouncing). `alignas(CACHE_LINE_SIZE)` physically separates them in RAM.
+3. **Bitwise Modulo:** The ring wrap-around utilizes `& (N - 1)` rather than `% N`, stripping an expensive integer division instruction out of the critical path.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ strictly bounded wait-free execution. No thread is ever blocked by the OS scheduler.
+* **Space Complexity:** $O(N)$ continuous heap/stack allocation determined at compile time.
+
+---
 
 ```rust
-// Rust 1.97.1 — crossbeam::queue::ArrayQueue is the production idiom (wait-free MPMC internally);
-// hand-rolled SPSC shown here for direct comparability to the C++ atomics above
+// Rust 1.97.1 — Unsafe Zero-Cost SPSC Ring Buffer
+// Avoids Option<T> initialization overhead using MaybeUninit and guarantees memory 
+// safety across thread boundaries via explicit Sync/Send trait implementations.
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Cache padding struct to prevent false sharing across CPU cores
+#[repr(C, align(64))]
+struct CachePadded<T>(T);
+
 pub struct SpscQueue<T, const N: usize> {
-    buf: [std::cell::UnsafeCell<Option<T>>; N],
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    // Buffer relies on MaybeUninit to prevent redundant memory zeroing on startup
+    buf: Box<[UnsafeCell<MaybeUninit<T>>; N]>,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
 }
+
+// Explicitly declare that the queue is thread-safe for both sharing (&T) and transferring (T)
 unsafe impl<T: Send, const N: usize> Sync for SpscQueue<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for SpscQueue<T, N> {}
+
 impl<T, const N: usize> SpscQueue<T, N> {
+    pub fn new() -> Self {
+        assert!(N.is_power_of_two(), "Capacity must be a power of 2");
+        let mut vec = Vec::with_capacity(N);
+        for _ in 0..N {
+            vec.push(UnsafeCell::new(MaybeUninit::uninit()));
+        }
+        Self {
+            buf: vec.into_boxed_slice().try_into().unwrap_or_else(|_| panic!()),
+            head: CachePadded(AtomicUsize::new(0)),
+            tail: CachePadded(AtomicUsize::new(0)),
+        }
+    }
+
     pub fn push(&self, v: T) -> Result<(), T> {
-        let h = self.head.load(Ordering::Relaxed);
-        let next = (h + 1) % N;
-        if next == self.tail.load(Ordering::Acquire) { return Err(v); }
-        unsafe { *self.buf[h].get() = Some(v); }
-        self.head.store(next, Ordering::Release);
+        let h = self.head.0.load(Ordering::Relaxed);
+        let next = (h + 1) & (N - 1);
+        
+        if next == self.tail.0.load(Ordering::Acquire) {
+            return Err(v);
+        }
+        
+        unsafe {
+            // Write directly to the uninitialized memory slot
+            (*self.buf[h].get()).write(v);
+        }
+        self.head.0.store(next, Ordering::Release);
         Ok(())
     }
+
+    pub fn pop(&self) -> Option<T> {
+        let t = self.tail.0.load(Ordering::Relaxed);
+        
+        if t == self.head.0.load(Ordering::Acquire) {
+            return None;
+        }
+        
+        let v = unsafe {
+            // Extract the value and assume ownership
+            (*self.buf[t].get()).assume_init_read()
+        };
+        
+        self.tail.0.store((t + 1) & (N - 1), Ordering::Release);
+        Some(v)
+    }
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+Rust's compiler rigorously defends against undefined behavior, which by default makes writing a zero-overhead lock-free queue difficult. Wrapping `T` in `Option<T>` introduces initialization overhead and branch checking during extraction. The institutional standard utilizes `MaybeUninit` inside an `UnsafeCell`. This completely bypasses the compiler's initialization checks, mapping exactly to raw C++ memory semantics. The `#[repr(C, align(64))]` decorator handles the L1 cache padding, and the `unsafe impl Sync/Send` blocks inform the Rust compiler that the raw pointer manipulation is thread-safe across the borrow checker boundary.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(1)$ wait-free execution.
+* **Space Complexity:** $O(N)$ allocated on the heap via `Box`. Memory is contiguous and dense.
+
+---
 
 ```python
-# Python 3.14.6 — queue.SimpleQueue (C-implemented, releases the GIL internally) is the
-# idiomatic lock-free-equivalent for SPSC in Python; true lock-free semantics aren't
-# expressible in pure Python without ctypes/native extensions
+# Python 3.14.6 — Amortized C-Queue Batched Pipeline
+# True lock-free shared memory semantics aren't expressible in pure Python due to the GIL. 
+# The institutional standard uses CPython's queue.SimpleQueue batched natively.
 import queue
-q = queue.SimpleQueue()
-def producer(tick): q.put(tick)
-def consumer(): return q.get()
+from typing import List, Optional, TypeVar
+
+T = TypeVar('T')
+
+class StrategyQueue:
+    """
+    Wraps CPython's C-implemented SimpleQueue to provide an idiomatic 
+    high-throughput pipeline. Mitigates GIL contention via batching.
+    """
+    def __init__(self, batch_size: int = 256):
+        # queue.SimpleQueue is a C-extension that utilizes a reentrant OS lock. 
+        # Crucially, it drops the GIL during underlying C-level put/get operations.
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._batch_size = batch_size
+        self._local_buffer: List[T] = []
+
+    def push(self, tick: T) -> None:
+        """Producer pushes single ticks; batched internally to minimize lock acquisitions."""
+        self._local_buffer.append(tick)
+        
+        # Amortize lock contention by only crossing the thread boundary every N ticks
+        if len(self._local_buffer) >= self._batch_size:
+            self._q.put(self._local_buffer)
+            self._local_buffer = [] # Rebind to new list reference
+
+    def flush(self) -> None:
+        """Flushes remaining ticks in producer buffer at the end of a trading session."""
+        if self._local_buffer:
+            self._q.put(self._local_buffer)
+            self._local_buffer = []
+
+    def pop_batch(self, block: bool = False, timeout: Optional[float] = None) -> List[T]:
+        """Consumer retrieves a pre-aggregated batch of ticks."""
+        try:
+            return self._q.get(block=block, timeout=timeout)
+        except queue.Empty:
+            return []
+
 ```
 
+**Architecture & Execution Explanation:**
+Because Python abstracts memory management via object references and enforces the Global Interpreter Lock (GIL), writing a true lock-free `head`/`tail` pointer ring buffer in pure Python is impossible (atomic instructions are not exposed). CPython provides `queue.SimpleQueue`, which is written in C and natively drops the GIL during execution. However, hitting a C-level mutex on every single market tick causes catastrophic scheduler thrashing. The standard HFT Python pattern is *batching*. By aggregating ticks into a local unshared list and pushing chunks of 256 over the `SimpleQueue`, lock acquisition overhead is slashed by $99.6\%$, allowing Python to process millions of ticks per second across threads.
+
+**Computational Complexity:**
+
+* **Time Complexity:** Amortized $O(1)$ per tick. The underlying C-queue is bounded by OS mutex acquisition speed, but dividing that latency by the `batch_size` yields highly efficient throughput.
+* **Space Complexity:** $O(N)$ where $N$ is the unbounded depth of the `SimpleQueue` plus the $O(B)$ memory of the local batch arrays.
+
+---
+
 ```q
-/ Q — process-level: tickerplant publishes, subscribers .u.sub via IPC async messages;
-/ within-process, single-threaded execution means no queue/lock is needed at all —
-/ the "queue" IS the tickerplant's log + async .z.ps callback dispatch
-/ (concurrency achieved architecturally, not via an in-process data structure)
-.z.ps:{[msg] processTickAsync msg}   / async publish callback, no locking required
+/ Q (kdb+ 4.0) — Zero-Lock Asynchronous IPC Architecture
+/ Concurrency is achieved via a single-threaded reactor pattern. 
+/ The tickerplant (producer) buffers and flushes asynchronously to the strategy (consumer).
+
+/ 1. Tickerplant (Producer): Asynchronous chunked push to avoid socket flooding
+.tp.subHandle: 0i;
+.tp.batch: ();
+.tp.batchSize: 1000;
+
+.tp.pub:{[tick]
+    / Append tick to the localized buffer array
+    .tp.batch,:(enlist tick);
+    
+    if[.tp.batchSize <= count .tp.batch;
+        / neg[.tp.subHandle] executes an asynchronous, non-blocking IPC flush
+        / The OS network stack acts as the actual "queue"
+        if[.tp.subHandle > 0; neg[.tp.subHandle] (`.u.upd; `ticks; .tp.batch)];
+        
+        / Reset buffer using the fast empty list assignment
+        .tp.batch: ();
+    ];
+ };
+
+/ 2. Strategy Engine (Consumer): Asynchronous message handler mapping
+/ KDB+ uses the main C-level event loop to listen on sockets; no explicit locks exist.
+.u.upd:{[tbl; data]
+    / data is received strictly as a contiguous vectorized block (columnar table)
+    / Strategy logic executes here fully synchronously without thread preemption
+    `strategyData insert data;
+    .algo.evaluateSignal[tbl];
+ };
+ 
+/ .z.ps is the native asynchronous message callback handler
+.z.ps: {[msg] 
+    / Automatically executes the received payload (e.g., (`.u.upd; `ticks; data))
+    value msg; 
+ };
+
 ```
+
+**Architecture & Execution Explanation:**
+KDB+ does not use multi-threading for data ingestion; it utilizes an event-driven Reactor pattern. Therefore, in-process concurrent data structures (like atomic ring buffers) do not exist in the q language. Instead, concurrency is achieved architecturally across separate processes. The Tickerplant (TP) acts as the producer, utilizing `neg[handle]` to perform a non-blocking asynchronous IPC write. The OS network buffer natively takes the place of the Ring Buffer. On the Strategy (Consumer) side, the kdb+ event loop natively polls the socket and triggers the `.z.ps` callback the instant data arrives. Because the strategy process evaluates ticks single-threadedly, it never requires locks, entirely averting deadlocks and context-switching overhead.
+
+**Computational Complexity:**
+
+* **Time Complexity:** Amortized $O(1)$ per tick execution on the CPU. Serialization overhead across the IPC socket bounds the wall-clock latency to the microsecond regime rather than the nanosecond regime of C++/Rust.
+* **Space Complexity:** $O(B)$ per process, where $B$ is the `batchSize` accumulating before flush, plus the dynamic allocation size required by the OS TCP/IP socket buffer.
 
 ---
 
@@ -783,94 +1424,420 @@ def consumer(): return q.get()
 
 ```cpp
 // C++26 — std::simd (portable, compiler auto-vectorizes further with -march=native)
+// Interleaved SIMD execution pipeline to avoid $O(N)$ intermediate buffer allocation.
 #include <experimental/simd>
+#include <span>
+
 namespace stdx = std::experimental;
-void ewma(std::span<const double> ret, double lambda, std::span<double> out) {
+
+void ewma_vol_simd(std::span<const double> ret, double lambda, std::span<double> out) {
+    if (ret.empty()) return;
+    
+    const size_t n = ret.size();
+    const double one_minus_lambda = 1.0 - lambda;
+    
+    // Initialize the recurrence base case
     double prev_var = ret[0] * ret[0];
     out[0] = prev_var;
-    for (std::size_t i = 1; i < ret.size(); ++i) {
-        prev_var = lambda * prev_var + (1 - lambda) * ret[i] * ret[i];
+    
+    // EWMA recurrence $V_t = \lambda V_{t-1} + (1-\lambda) R_t^2$ contains a strict loop-carry 
+    // dependency, making full vectorization mathematically impossible. We SIMD the 
+    // squaring operation in L1 cache ahead of the scalar recurrence pointer.
+    constexpr size_t simd_width = stdx::native_simd<double>::size();
+    alignas(stdx::memory_alignment_v<stdx::native_simd<double>>) double sq_buf[simd_width];
+    
+    size_t i = 1;
+    for (; i + simd_width <= n; i += simd_width) {
+        // SIMD batch load and square
+        stdx::native_simd<double> v(&ret[i], stdx::element_aligned);
+        (v * v).copy_to(sq_buf, stdx::element_aligned);
+        
+        // Unrolled scalar recurrence for the current batch
+        for (size_t j = 0; j < simd_width; ++j) {
+            prev_var = lambda * prev_var + one_minus_lambda * sq_buf[j];
+            out[i + j] = prev_var;
+        }
+    }
+    
+    // Scalar tail for remainders not fitting into simd_width
+    for (; i < n; ++i) {
+        prev_var = lambda * prev_var + one_minus_lambda * (ret[i] * ret[i]);
         out[i] = prev_var;
     }
-    // Note: EWMA recurrence is inherently sequential (each step depends on prior);
-    // SIMD applies instead to the ret[i]*ret[i] squaring pass, done via std::simd batches
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+The core limitation of Exponentially Weighted Moving Average (EWMA) is the loop-carry dependency inherent in the recurrence formula $V_t = \lambda V_{t-1} + (1-\lambda) R_t^2$. Because $V_t$ relies on $V_{t-1}$, the recurrence cannot be parallelized. However, squaring the returns ($R_t^2$) is purely cross-sectional. This implementation utilizes `std::experimental::simd` to process the squaring pass in chunks mapped directly to AVX2/AVX-512 registers. Crucially, instead of allocating a separate $O(N)$ vector for the squared returns, it processes one SIMD chunk at a time into a tiny stack-allocated buffer, immediately applying the scalar recurrence. This maximizes L1 cache spatial locality.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$. The arithmetic intensity is optimized by substituting sequentially dispatched scalar multiplications with $\lceil N/W \rceil$ SIMD operations (where $W$ is lane width), plus exactly $N$ scalar additions and multiplications for the recurrence.
+* **Space Complexity:** $O(1)$ auxiliary space. The `sq_buf` array strictly consumes $W \times 8$ bytes on the stack, eliminating dynamic heap allocations.
+
+---
 
 ```rust
-// Rust 1.97.1 — std::simd (portable_simd) for the elementwise square pass
+// Rust 1.97.1 — std::simd (portable_simd) 
+// Interleaved f64x4 SIMD squaring and loop-unrolled scalar accumulation
 #![feature(portable_simd)]
-use std::simd::f64x4;
-pub fn square_batch(ret: &[f64], out: &mut [f64]) {
-    let chunks = ret.chunks_exact(4);
-    let rem = chunks.remainder();
-    for (c, o) in chunks.clone().zip(out.chunks_exact_mut(4)) {
-        let v = f64x4::from_slice(c);
-        (v * v).copy_to_slice(o);
+use std::simd::{f64x4, num::SimdFloat};
+
+pub fn ewma_vol_simd(ret: &[f64], lambda: f64, out: &mut [f64]) {
+    if ret.is_empty() { return; }
+    
+    let n = ret.len();
+    let one_minus_lambda = 1.0 - lambda;
+    
+    let mut prev_var = ret[0] * ret[0];
+    out[0] = prev_var;
+    
+    let mut i = 1;
+    
+    // Process in chunks of 4 (maps perfectly to 256-bit AVX2 f64x4 registers)
+    while i + 4 <= n {
+        let chunk = &ret[i..i+4];
+        let v = f64x4::from_slice(chunk);
+        
+        // SIMD batch square
+        let v_sq = v * v; 
+        let sq_arr = v_sq.to_array();
+        
+        // Unrolled scalar recurrence circumvents branch prediction overhead
+        prev_var = lambda * prev_var + one_minus_lambda * sq_arr[0];
+        out[i] = prev_var;
+        
+        prev_var = lambda * prev_var + one_minus_lambda * sq_arr[1];
+        out[i+1] = prev_var;
+        
+        prev_var = lambda * prev_var + one_minus_lambda * sq_arr[2];
+        out[i+2] = prev_var;
+        
+        prev_var = lambda * prev_var + one_minus_lambda * sq_arr[3];
+        out[i+3] = prev_var;
+        
+        i += 4;
     }
-    for (r, o) in rem.iter().zip(out.iter_mut().rev()) { *o = r * r; }
+    
+    // Scalar tail processing
+    for j in i..n {
+        prev_var = lambda * prev_var + one_minus_lambda * (ret[j] * ret[j]);
+        out[j] = prev_var;
+    }
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+Rust's `portable_simd` API allows for explicit cross-platform vectorization guarantees rather than relying purely on LLVM's auto-vectorizer heuristics (which frequently fail on loop-carried scalar blocks). By extracting `f64x4` slices, the CPU fetches 256 bits of data simultaneously. The array extraction `.to_array()` drops the data safely into L1 cache, where an explicitly unrolled 4-step block executes the sequential EWMA. Unrolling the loop inside the chunk prevents branch predictor saturation during microsecond-level tick consumption.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$. Executed in single-pass with $\sim 75\%$ reduction in squaring instruction cycles on AVX2 hardware compared to a naive scalar loop.
+* **Space Complexity:** $O(1)$ auxiliary space. The `sq_arr` resolves natively into CPU registers and zero heap allocation is performed.
+
+---
 
 ```python
-# Python 3.14.6 — NumPy dispatches the squaring pass to SIMD; EWMA recurrence via pandas' 
-# Cython-compiled ewm() (also SIMD/vectorized internally for the variance-weighting arithmetic)
-import numpy as np, pandas as pd
-def ewma_vol(ret: np.ndarray, lam: float) -> np.ndarray:
-    return pd.Series(ret**2).ewm(alpha=1 - lam, adjust=False).mean().to_numpy()
+# Python 3.14.6 — Numba (LLVM JIT) Zero-Copy Execution
+# Avoids the intermediate buffer bloat and GIL overhead of pandas.Series.ewm
+import numpy as np
+from numba import njit
+
+@njit(cache=True, fastmath=True)
+def ewma_vol_simd(ret: np.ndarray, lambda_: float) -> np.ndarray:
+    n = ret.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return out
+        
+    one_minus_lambda = 1.0 - lambda_
+    
+    prev_var = ret[0] * ret[0]
+    out[0] = prev_var
+    
+    # Utilizing LLVM fastmath allows the compiler to auto-vectorize the 
+    # pipelined multiply-accumulate (MAC) instructions where mathematically valid.
+    for i in range(1, n):
+        r_sq = ret[i] * ret[i]
+        prev_var = lambda_ * prev_var + one_minus_lambda * r_sq
+        out[i] = prev_var
+        
+    return out
+
 ```
+
+**Architecture & Execution Explanation:**
+A purely vectorized approach in Pandas/NumPy (e.g., `pd.Series(ret**2).ewm(...)`) is a massive memory anti-pattern. It forces the allocation of an entirely new NumPy array for the `ret**2` operation, which crushes memory bandwidth when dealing with gigabytes of tick data. The institutional standard utilizes Numba's `@njit` with `fastmath=True`. This pushes the Python code directly down to LLVM IR, dropping the Global Interpreter Lock (GIL). LLVM pipelines the loop, fetching $R_t$ and computing $R_t^2$ exactly one CPU cycle before it is needed for the scalar $V_t$ accumulation, achieving C++-equivalent speed without intermediate buffering.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$. Execution approaches theoretical memory bandwidth limits due to strict continuous array iteration with no Python object overhead.
+* **Space Complexity:** $O(N)$ for the returned `out` array. Auxiliary space is strictly $O(1)$ as intermediate calculations (`r_sq`) are held in CPU registers.
+
+---
 
 ```q
-/ Q — `ema` is a BUILT-IN primitive verb; the recurrence and the squaring are both
-/ dispatched to hand-tuned C kernels with zero q-level looping
-ewmaVol:{[ret;lambda] lambda ema ret*ret}
+/ Q (kdb+ 4.0) — C-Kernel Dispatch via `ema`
+/ `ema` is a BUILT-IN primitive verb written in hand-tuned C.
+/ KDB+ syntax x ema y computes: r[0]=y[0], r[i] = (1-x)*r[i-1] + x*y[i].
+/ To match EWMA V_t = lambda*V_{t-1} + (1-lambda)*R_t^2, we map x to (1 - lambda).
+
+ewmaVol:{[ret; lambda]
+    / 1. AVX2/AVX-512 vectorized element-wise squaring
+    sqRet: ret * ret; 
+    
+    / 2. Native C-kernel recurrence dispatch
+    / The first argument to ema dictates the weight applied to the new observation.
+    (1f - lambda) ema sqRet
+ }
+
 ```
 
+**Architecture & Execution Explanation:**
+KDB+ excels because it abstracts loops into primitive verbs (`ema`) mapped directly to highly optimized C kernels. The operation `ret * ret` automatically dispatches to SIMD instructions natively supported by the kdb+ interpreter, evaluating across the cross-section instantaneously. The `ema` function then handles the sequential loop-carry dependency exclusively at the C level. By mapping the formula weights correctly—passing $(1 - \lambda)$ as the smoothing parameter—Q replicates the mathematical structure of the C++ loop dynamically without compiling custom binaries.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(N)$. Requires two strict passes over the data: one SIMD pass for squaring the returns, and one sequential C-level pass for the exponential moving average.
+* **Space Complexity:** $O(N)$ auxiliary space. Unlike the Numba or interleaved C++ solutions, q's functional programming paradigm dictates that `sqRet` exists as an entirely separate temporary vector in KDB+'s memory space before `ema` consumes it.
 ---
 
 ## 2.6 · GPU — Monte Carlo Path Simulation
 
 ```cpp
-// C++26 — SYCL (khronos, ISO-C++-integrated GPU dispatch) sketch for GBM path simulation
+// C++26 — SYCL (khronos, ISO-C++-integrated GPU dispatch) 
+// Fully implemented USM (Unified Shared Memory) memory management and parallel RNG dispatch
 #include <sycl/sycl.hpp>
-void mc_paths_gpu(sycl::queue& q, double s0, double mu, double sigma, double dt,
-                   int n_steps, int n_paths, double* out) {
+#include <oneapi/dpl/random>
+#include <vector>
+
+std::vector<double> mc_paths_gpu(double s0, double mu, double sigma, double dt, int n_steps, int n_paths) {
+    sycl::queue q(sycl::gpu_selector_v);
+    
+    // Allocate Unified Shared Memory on the device
+    double* d_out = sycl::malloc_device<double>(n_paths, q);
+    
     q.parallel_for(sycl::range<1>(n_paths), [=](sycl::id<1> i) {
         double s = s0;
-        oneapi::dpl::minstd_rand eng(42, i[0]);
+        // Per-thread random engine seeded by thread index
+        oneapi::dpl::minstd_rand eng(42 + i[0]);
         oneapi::dpl::normal_distribution<double> dist(0.0, 1.0);
-        for (int t = 0; t < n_steps; ++t)
-            s *= sycl::exp((mu - 0.5 * sigma * sigma) * dt + sigma * sycl::sqrt(dt) * dist(eng));
-        out[i[0]] = s;
+        
+        double drift = (mu - 0.5 * sigma * sigma) * dt;
+        double vol = sigma * sycl::sqrt(dt);
+        
+        for (int t = 0; t < n_steps; ++t) {
+            s *= sycl::exp(drift + vol * dist(eng));
+        }
+        d_out[i[0]] = s;
     }).wait();
+    
+    // Copy results back to host
+    std::vector<double> h_out(n_paths);
+    q.memcpy(h_out.data(), d_out, n_paths * sizeof(double)).wait();
+    
+    sycl::free(d_out, q);
+    return h_out;
 }
+
 ```
+
+**Architecture & Execution Explanation:**
+This implementation leverages Khronos SYCL to provide a vendor-agnostic (NVIDIA/AMD/Intel) GPU dispatch mechanism. It utilizes Unified Shared Memory (USM) via `sycl::malloc_device` to allocate the output buffer directly on the GPU VRAM. The `sycl::parallel_for` lambda compiles down to a device kernel where each GPU thread manages exactly one Monte Carlo trajectory. Random numbers are generated securely on-device using `oneapi::dpl::minstd_rand` to avoid the massive latency penalty of transferring CPU-generated random matrices over the PCIe bus.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(T \cdot \lceil N/P \rceil)$ wall-clock time, where $T$ is `n_steps`, $N$ is `n_paths`, and $P$ is the number of concurrent GPU cores. The total algorithmic work performed across all threads is $O(N \times T)$.
+* **Space Complexity:** $O(N)$ allocated on the device (VRAM) to store the terminal prices, plus $O(N)$ allocated on the host (RAM) for the final copied vector. We do not store intermediate path steps, ensuring memory scales linearly with paths rather than paths $\times$ time steps.
+
+---
 
 ```rust
-// Rust 1.97.1 — CubeCL / cudarc / wgpu are the current GPU-compute crates; wgpu (WGSL kernel) shown
-// Kernel (WGSL, compiled at build time via wgpu):
-//   @compute @workgroup_size(256)
-//   fn mc_step(@builtin(global_invocation_id) id: vec3<u32>) { /* GBM step, RNG via PCG in-kernel */ }
-// Rust host code dispatches via wgpu::Device::create_compute_pipeline + queue.submit(...)
+// Rust 1.97.1 — cudarc crate (NVRTC PTX compilation)
+// Institutional quant pipelines avoid WGPU overhead and dispatch raw PTX kernels natively via cudarc
+use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use cudarc::nvrtc::compile_ptx;
+
+pub fn mc_paths_gpu(s0: f64, mu: f64, sigma: f64, dt: f64, n_steps: i32, n_paths: usize) -> Vec<f64> {
+    let dev = CudaDevice::new(0).expect("No CUDA device found");
+    
+    let ptx_src = r#"
+    extern "C" __global__ void gbm_paths(double* out, double s0, double mu, double sigma, double dt, int n_steps, int n_paths) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n_paths) return;
+        
+        unsigned int seed = idx + 1; // XORShift requires non-zero seed
+        double s = s0;
+        double drift = (mu - 0.5 * sigma * sigma) * dt;
+        double vol = sigma * sqrt(dt);
+        
+        for (int t = 0; t < n_steps; t+=2) {
+            // XORShift32 to Box-Muller transformation inside kernel
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            double u1 = fmax(seed / 4294967295.0, 1e-9);
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            double u2 = seed / 4294967295.0;
+            
+            double r = sqrt(-2.0 * log(u1));
+            double theta = 2.0 * 3.14159265358979323846 * u2;
+            double z1 = r * cos(theta);
+            double z2 = r * sin(theta);
+            
+            s *= exp(drift + vol * z1);
+            if (t + 1 < n_steps) {
+                s *= exp(drift + vol * z2);
+            }
+        }
+        out[idx] = s;
+    }
+    "#;
+
+    let ptx = compile_ptx(ptx_src).unwrap();
+    dev.load_ptx(ptx, "mc_module", &["gbm_paths"]).unwrap();
+    let f = dev.get_func("mc_module", "gbm_paths").unwrap();
+
+    let mut out_host = vec![0.0f64; n_paths];
+    let out_dev = dev.htod_copy(out_host.clone()).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (((n_paths as u32) + 255) / 256, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe { f.launch(cfg, (&out_dev, s0, mu, sigma, dt, n_steps, n_paths as i32)) }.unwrap();
+    dev.dtoh_sync_copy_into(&out_dev, &mut out_host).unwrap();
+    
+    out_host
+}
+
 ```
+
+**Architecture & Execution Explanation:**
+Rather than relying on abstract graphics pipelines (like WGPU) which carry translation overhead, this Rust implementation uses `cudarc` to compile a raw CUDA C string into PTX (Parallel Thread Execution) at runtime via NVRTC (NVIDIA Runtime Compilation). To achieve maximum occupancy without relying on heavy external device libraries like `cuRAND`, it embeds a fast XORShift32 pseudo-random number generator paired with a Box-Muller transform directly inside the kernel loop. The loop is unrolled by a factor of 2 (since Box-Muller generates two independent standard normal variables simultaneously).
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(T \cdot \lceil N/P \rceil)$ wall-clock time. The Box-Muller loop unrolling reduces the PRNG instruction count by roughly 50% compared to standard sequential generation, maximizing arithmetic intensity per cycle. Total algorithmic work remains $O(N \times T)$.
+* **Space Complexity:** $O(N)$ host memory for `out_host` and $O(N)$ device memory for `out_dev`. The XORShift states are kept entirely in local GPU thread registers, consuming zero global VRAM space.
+
+---
 
 ```python
-# Python 3.14.6 — CuPy mirrors NumPy's API 1:1 but executes on CUDA cores
+# Python 3.14.6 — CuPy RawKernel
+# Eradicates the massive CPU/GPU synchronization bottleneck in naive CuPy for-loops 
+# by compiling the GBM trajectory and PRNG directly into a single CUDA kernel block.
 import cupy as cp
-def mc_paths_gpu(s0, mu, sigma, dt, n_steps, n_paths):
-    s = cp.full(n_paths, s0)
-    for _ in range(n_steps):
-        z = cp.random.standard_normal(n_paths)
-        s *= cp.exp((mu - 0.5 * sigma**2) * dt + sigma * cp.sqrt(dt) * z)
-    return s
+
+gbm_kernel = cp.RawKernel(r'''
+extern "C" __global__ void gbm_paths(double* out, double s0, double mu, double sigma, double dt, int n_steps, int n_paths) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_paths) return;
+    
+    unsigned int seed = idx + 12345;
+    double s = s0;
+    double drift = (mu - 0.5 * sigma * sigma) * dt;
+    double vol = sigma * sqrt(dt);
+    
+    for (int t = 0; t < n_steps; t+=2) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        double u1 = fmax(seed / 4294967295.0, 1e-9);
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        double u2 = seed / 4294967295.0;
+        
+        double r = sqrt(-2.0 * log(u1));
+        double theta = 2.0 * 3.14159265358979323846 * u2;
+        
+        s *= exp(drift + vol * (r * cos(theta)));
+        if (t + 1 < n_steps) s *= exp(drift + vol * (r * sin(theta)));
+    }
+    out[idx] = s;
+}
+''', 'gbm_paths')
+
+def mc_paths_gpu(s0: float, mu: float, sigma: float, dt: float, n_steps: int, n_paths: int) -> cp.ndarray:
+    out = cp.empty(n_paths, dtype=cp.float64)
+    threads_per_block = 256
+    blocks_per_grid = (n_paths + (threads_per_block - 1)) // threads_per_block
+    
+    gbm_kernel((blocks_per_grid,), (threads_per_block,), (out, s0, mu, sigma, dt, n_steps, n_paths))
+    return out
+
 ```
 
+**Architecture & Execution Explanation:**
+A naive implementation in Python would use `cupy.random.standard_normal` inside a Python `for` loop over time steps. This is a severe anti-pattern that triggers a CPU-to-GPU kernel launch synchronization penalty on *every single time step*, crippling throughput. The `cp.RawKernel` architecture solves this by wrapping the identical C++ PTX kernel logic (from the Rust example) into a Just-In-Time compiled string. Python merely calculates the block/grid dimensions and issues a single kernel launch. The GPU handles the entire time loop independently.
+
+**Computational Complexity:**
+
+* **Time Complexity:** $O(T \cdot \lceil N/P \rceil)$ wall-clock time. Because the C++ string compiles to identical PTX instructions as the Rust example, the execution latency on the GPU is completely indistinguishable from native C++/Rust. Total work is $O(N \times T)$.
+* **Space Complexity:** $O(N)$ VRAM via `cp.empty`. Host memory (RAM) is not utilized unless `.get()` is explicitly called to pull the tensor back to the CPU, keeping the operation strictly zero-copy on the host side.
+
+---
+
 ```q
-/ Q (kdb+) — no native GPU dispatch; production kdb+ shops offload GPU work via
-/ embedPy/PyKX calling into CuPy/PyTorch, or via a q<->CUDA C shared library (k.h FFI).
-/ This is a genuine capability gap versus the other three languages.
-gpuPaths:{[s0;mu;sigma;dt;nSteps;nPaths] .pykx.eval["mc_paths_gpu"][s0;mu;sigma;dt;nSteps;nPaths]}
+/ Q (kdb+) — FFI Zero-Copy Architecture via PyKX
+/ kdb+ possesses no native GPU compiler. Institutional standard avoids socket/IPC 
+/ latency by mapping the GPU tensor directly back into the q process space natively via PyKX.
+
+\l pykx.q
+
+/ 1. Inject the optimized CuPy RawKernel from above into the embedded PyKX interpreter
+.pykx.exec"
+import cupy as cp
+import numpy as np
+gbm_kernel = cp.RawKernel(r'''
+extern \"C\" __global__ void gbm_paths(double* out, double s0, double mu, double sigma, double dt, int n_steps, int n_paths) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_paths) return;
+    
+    unsigned int seed = idx + 12345;
+    double s = s0;
+    double drift = (mu - 0.5 * sigma * sigma) * dt;
+    double vol = sigma * sqrt(dt);
+    
+    for (int t = 0; t < n_steps; t+=2) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        double u1 = fmax(seed / 4294967295.0, 1e-9);
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        double u2 = seed / 4294967295.0;
+        
+        double r = sqrt(-2.0 * log(u1));
+        double theta = 2.0 * 3.14159265358979323846 * u2;
+        
+        s *= exp(drift + vol * (r * cos(theta)));
+        if (t + 1 < n_steps) s *= exp(drift + vol * (r * sin(theta)));
+    }
+    out[idx] = s;
+}
+''', 'gbm_paths')
+
+def run_mc(s0, mu, sigma, dt, n_steps, n_paths):
+    out = cp.empty(n_paths, dtype=cp.float64)
+    threads = 256
+    blocks = (n_paths + (threads - 1)) // threads
+    gbm_kernel((blocks,), (threads,), (out, s0, mu, sigma, dt, n_steps, n_paths))
+    # PyKX translates numpy arrays back to q lists automatically
+    return out.get() 
+";
+
+/ 2. Bind the embedded Python function natively to a q function namespace
+gpuPaths: .pykx.get[`run_mc; <]
+
+/ 3. Execution returns a native q float vector (`float$()) immediately
+/ gpuPaths[100.0; 0.05; 0.2; 0.003968; 252; 1000000]
+
 ```
+
+**Architecture & Execution Explanation:**
+Because KDB+ does not possess a native GPU compilation pipeline, writing a purely q-based GPU dispatch is impossible. Historically, quant pods sent data to a detached Python process over IPC/sockets (`.z.ph`), incurring massive serialization penalties. The modern institutional solution is `PyKX`, which embeds the Python C-API directly inside the q memory space. The q process executes the exact same optimized CuPy `RawKernel` string as the Python implementation. The final `.get()` call transfers the GPU VRAM buffer to the host, and PyKX's C-bindings automatically wrap that pointer into a native q $k$ object (a standard float vector), entirely eliminating socket transmission.
+
+**Computational Complexity:**
+
+* **Time Complexity:** GPU execution bounds at $O(T \cdot \lceil N/P \rceil)$. However, there is a strict sequential penalty of $O(N)$ added to the wall-clock time required for the PyKX FFI boundary to copy the NumPy array memory into KDB+'s internal slab allocator format.
+* **Space Complexity:** $O(N)$ VRAM (CuPy allocation), plus $O(N)$ temporary host RAM (NumPy intermediate), plus $O(N)$ final KDB+ vector allocation. This results in $3 \times N$ peak memory footprint during the FFI handoff before Python's garbage collector claims the intermediate buffer.
 
 [🔝 Back to Top](#-table-of-contents)
 
