@@ -1,0 +1,13 @@
+language,benchmark,seconds
+cpp,ring_buffer_push_1e6,0.00074166
+cpp,vwap_1e6,0.00158555
+cpp,ewma_1e6,0.00211129
+cpp,monte_carlo_gbm_1e5x252,0.584265
+python,ring_buffer_push_1e6,0.3124842240000021
+python,vwap_1e6,0.01236963499999888
+python,ewma_1e6,0.0024659569999982978
+python,monte_carlo_gbm_1e5x252,0.49963806099999886
+rust,ring_buffer_push_1e6,0.000958219
+rust,vwap_1e6,0.000956756
+rust,ewma_1e6,0.001869531
+rust,monte_carlo_gbm_1e5x252,0.163116931

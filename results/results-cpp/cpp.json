@@ -1,0 +1,9 @@
+{
+  "language": "cpp",
+  "benchmarks": {
+    "ring_buffer_push_1e6": 0.00074166,
+    "vwap_1e6": 0.00158555,
+    "ewma_1e6": 0.00211129,
+    "monte_carlo_gbm_1e5x252": 0.584265
+  }
+}

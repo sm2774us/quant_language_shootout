@@ -1,0 +1,9 @@
+{
+  "language": "rust",
+  "benchmarks": {
+    "ring_buffer_push_1e6": 0.000958219,
+    "vwap_1e6": 0.000956756,
+    "ewma_1e6": 0.001869531,
+    "monte_carlo_gbm_1e5x252": 0.163116931
+  }
+}
